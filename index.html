@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Earning Website V2</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Monetag SDK -->
+    <script src='//libtl.com/sdk.js' data-zone='9934836' data-sdk='show_9934836'></script>
+    <!-- Firebase SDK -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, setDoc, updateDoc, onSnapshot, collection, query, where, addDoc, getDocs, runTransaction } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // IMPORTANT: These variables are automatically set when hosting on Vercel.
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        
+        let app, db, auth, userId;
+
+        if (firebaseConfig) {
+            app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+        } else {
+            console.error("Firebase config is missing. Please provide it.");
+        }
+
+        let lastAdTime = null;
+        let adsWatchedToday = 0;
+        let adLimit = 5; // Daily ad viewing limit
+        let adInterval = 5 * 60 * 1000; // Interval between ads (5 minutes)
+        let dailyResetTime = 12 * 60 * 60 * 1000; // Reset ads watched every 12 hours
+        let withdrawLimit = 1000;
+        let referLimit = 10;
+        const DAILY_BONUS_AMOUNT = 50;
+
+        // Modal functions
+        function showModal(title, message) {
+            document.getElementById('modal-title').innerText = title;
+            document.getElementById('modal-message').innerText = message;
+            document.getElementById('modal').classList.remove('hidden');
+        }
+        
+        function hideModal() {
+            document.getElementById('modal').classList.add('hidden');
+        }
+
+        // Authentication State Listener
+        onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                userId = user.uid;
+                await initializeUser(userId);
+                showPage('home');
+            } else {
+                try {
+                    await signInAnonymously(auth);
+                } catch (error) {
+                    console.error("Anonymous sign-in failed: ", error);
+                }
+            }
+        });
+
+        async function initializeUser(uid) {
+            try {
+                const userDocRef = doc(db, `/artifacts/${appId}/users/${uid}/userData/profile`);
+                const userDoc = await getDoc(userDocRef);
+                
+                // Get URL parameters to check for a referrer
+                const urlParams = new URLSearchParams(window.location.search);
+                const referrerId = urlParams.get('start');
+
+                if (!userDoc.exists()) {
+                    const profileData = {
+                        balance: 0,
+                        totalReferrals: 0,
+                        lastAdTimestamp: 0,
+                        adsWatchedToday: 0,
+                        lastDailyReset: Date.now(),
+                        lastDailyBonus: 0,
+                        referredBy: referrerId || null,
+                    };
+                    await setDoc(userDocRef, profileData);
+                    console.log("New user profile created.");
+                    
+                    // If a referrer ID exists and it's not the current user's ID, update their referral count
+                    if (referrerId && referrerId !== uid) {
+                        const referrerDocRef = doc(db, `/artifacts/${appId}/users/${referrerId}/userData/profile`);
+                        try {
+                            await runTransaction(db, async (transaction) => {
+                                const referrerDoc = await transaction.get(referrerDocRef);
+                                if (referrerDoc.exists()) {
+                                    const currentReferrals = referrerDoc.data().totalReferrals || 0;
+                                    transaction.update(referrerDocRef, { totalReferrals: currentReferrals + 1 });
+                                }
+                            });
+                            console.log("Referral successfully counted.");
+                        } catch (e) {
+                            console.error("Error in referral transaction: ", e);
+                        }
+                    }
+
+                } else {
+                    const data = userDoc.data();
+                    const now = Date.now();
+                    if (now - data.lastDailyReset > dailyResetTime) {
+                         data.adsWatchedToday = 0;
+                         data.lastDailyReset = now;
+                         await setDoc(userDocRef, data);
+                    }
+                }
+
+                // Listen for real-time updates to the profile
+                onSnapshot(userDocRef, (docSnapshot) => {
+                    if (docSnapshot.exists()) {
+                        const data = docSnapshot.data();
+                        document.getElementById('user-id').innerText = data.userId || uid;
+                        document.getElementById('user-balance').innerText = `Current Balance: ${data.balance || 0} BDT`;
+                        document.getElementById('refer-count').innerText = data.totalReferrals || 0;
+                        adsWatchedToday = data.adsWatchedToday || 0;
+                        lastAdTime = data.lastAdTimestamp || 0;
+                        updateEarningPage();
+                        updateDailyBonusButton(data.lastDailyBonus);
+                    }
+                });
+
+                // Listen for real-time updates to withdrawals
+                const withdrawalQuery = query(collection(db, `/artifacts/${appId}/public/data/withdrawals`), where('userId', '==', uid));
+                onSnapshot(withdrawalQuery, (querySnapshot) => {
+                    const withdrawalHistory = [];
+                    querySnapshot.forEach((doc) => {
+                        withdrawalHistory.push(doc.data());
+                    });
+                    renderWithdrawalHistory(withdrawalHistory);
+                });
+
+            } catch (error) {
+                console.error("Error initializing user: ", error);
+            }
+        }
+
+        function updateEarningPage() {
+            const earnButton = document.getElementById('earn-button');
+            const timerText = document.getElementById('timer');
+            const adStatusText = document.getElementById('ad-status');
+            const now = Date.now();
+            
+            if (adsWatchedToday >= adLimit) {
+                earnButton.disabled = true;
+                earnButton.innerText = 'Daily Limit Reached';
+                adStatusText.innerText = 'You can watch a new set of 5 ads after 12 hours.';
+                timerText.innerText = '';
+            } else {
+                const timeElapsed = now - lastAdTime;
+                if (timeElapsed < adInterval) {
+                    const timeLeft = Math.floor((adInterval - timeElapsed) / 1000);
+                    earnButton.disabled = true;
+                    earnButton.innerText = `... Please wait ${timeLeft}s`;
+                    adStatusText.innerText = `Wait ${Math.floor(timeLeft / 60)} minutes and ${timeLeft % 60} seconds for the next ad.`;
+                    
+                    setTimeout(updateEarningPage, 1000);
+                } else {
+                    earnButton.disabled = false;
+                    earnButton.innerText = 'Watch Ad';
+                    adStatusText.innerText = `You have watched ${adsWatchedToday}/${adLimit} ads today.`;
+                    timerText.innerText = '';
+                }
+            }
+        }
+
+        async function watchAd() {
+            if (!userId) {
+                showModal('Error', 'Please log in.');
+                return;
+            }
+            const now = Date.now();
+            if (adsWatchedToday >= adLimit) {
+                showModal('Limit Reached', 'Your ad viewing limit for today is over.');
+                return;
+            }
+            if (now - lastAdTime < adInterval) {
+                showModal('Please Wait', 'You have to wait 5 minutes before watching the next ad.');
+                return;
+            }
+            
+            document.getElementById('earn-button').disabled = true;
+            document.getElementById('earn-button').innerText = 'Loading Ad...';
+            
+            try {
+                // This code calls the ad and handles the reward based on success or failure.
+                show_9934836('pop').then(async () => {
+                    // This code runs only if the user watched the ad successfully.
+                    const userDocRef = doc(db, `/artifacts/${appId}/users/${userId}/userData/profile`);
+                    const userDoc = await getDoc(userDocRef);
+                    const data = userDoc.data();
+                    
+                    const newBalance = (data.balance || 0) + 20;
+                    const newAdsWatched = (data.adsWatchedToday || 0) + 1;
+                    
+                    await updateDoc(userDocRef, {
+                        balance: newBalance,
+                        adsWatchedToday: newAdsWatched,
+                        lastAdTimestamp: Date.now()
+                    });
+                    showModal('Success', '20 BDT has been added to your account for watching the ad!');
+                    updateEarningPage();
+                }).catch(e => {
+                    // This code runs if there was an error with the ad.
+                    console.error("Ad failed to play: ", e);
+                    showModal('Ad Error', 'The ad failed to play. Please try again.');
+                    updateEarningPage(); // Re-enable the button
+                });
+            } catch (error) {
+                console.error("Error during ad function call: ", error);
+                showModal('Ad Error', 'There was an issue with the ad. Please try again.');
+                updateEarningPage();
+            }
+        }
+
+        // New Feature: Daily Bonus
+        function updateDailyBonusButton(lastBonusTimestamp) {
+            const dailyBonusBtn = document.getElementById('daily-bonus-btn');
+            const now = Date.now();
+            const timeSinceLastBonus = now - lastBonusTimestamp;
+            const twentyFourHours = 24 * 60 * 60 * 1000;
+
+            if (timeSinceLastBonus < twentyFourHours) {
+                dailyBonusBtn.disabled = true;
+                const timeLeft = Math.floor((twentyFourHours - timeSinceLastBonus) / 1000);
+                dailyBonusBtn.innerText = `Next bonus in ${Math.floor(timeLeft / 3600)}h ${Math.floor((timeLeft % 3600) / 60)}m ${timeLeft % 60}s`;
+            } else {
+                dailyBonusBtn.disabled = false;
+                dailyBonusBtn.innerText = 'Claim Daily Bonus';
+            }
+        }
+        
+        async function claimDailyBonus() {
+            if (!userId) {
+                showModal('Error', 'Please log in.');
+                return;
+            }
+            try {
+                const userDocRef = doc(db, `/artifacts/${appId}/users/${userId}/userData/profile`);
+                const userDoc = await getDoc(userDocRef);
+                const data = userDoc.data();
+                
+                const now = Date.now();
+                const lastBonusTimestamp = data.lastDailyBonus || 0;
+                const twentyFourHours = 24 * 60 * 60 * 1000;
+                
+                if (now - lastBonusTimestamp < twentyFourHours) {
+                    showModal('Please Wait', 'You have already claimed today\'s bonus. Try again in 24 hours.');
+                    return;
+                }
+                
+                await updateDoc(userDocRef, {
+                    balance: (data.balance || 0) + DAILY_BONUS_AMOUNT,
+                    lastDailyBonus: now,
+                });
+                showModal('Success', `${DAILY_BONUS_AMOUNT} BDT has been added to your account!`);
+            } catch (error) {
+                console.error("Error claiming daily bonus: ", error);
+                showModal('Error', 'There was a problem claiming the daily bonus.');
+            }
+        }
+
+        // New Feature: Task Submission (Example)
+        async function completeTask(taskId, reward) {
+            if (!userId) {
+                showModal('Error', 'Please log in.');
+                return;
+            }
+            try {
+                const userDocRef = doc(db, `/artifacts/${appId}/users/${userId}/userData/profile`);
+                const userDoc = await getDoc(userDocRef);
+                const data = userDoc.data();
+                
+                const tasksCompletedRef = collection(db, `/artifacts/${appId}/users/${userId}/userData/completedTasks`);
+                const taskQuery = query(tasksCompletedRef, where('taskId', '==', taskId));
+                const querySnapshot = await getDocs(taskQuery);
+                
+                if (!querySnapshot.empty) {
+                    showModal('Already Completed', 'You have already completed this task.');
+                    return;
+                }
+
+                await addDoc(tasksCompletedRef, { taskId: taskId, completedAt: Date.now() });
+                await updateDoc(userDocRef, { balance: (data.balance || 0) + reward });
+                showModal('Success', `${reward} BDT has been added to your account!`);
+                
+                // Hide the task button
+                document.getElementById(`task-${taskId}`).disabled = true;
+                document.getElementById(`task-${taskId}`).innerText = 'Completed';
+            } catch (error) {
+                console.error("Error completing task: ", error);
+                showModal('Error', 'There was a problem completing the task.');
+            }
+        }
+
+        // New Feature: Withdrawal History
+        function renderWithdrawalHistory(history) {
+            const tableBody = document.getElementById('history-table-body');
+            tableBody.innerHTML = '';
+            if (history.length === 0) {
+                document.getElementById('no-history').classList.remove('hidden');
+                return;
+            }
+            document.getElementById('no-history').classList.add('hidden');
+            history.sort((a, b) => b.timestamp - a.timestamp); // Newest first
+
+            history.forEach(item => {
+                const row = document.createElement('tr');
+                row.className = 'border-b last:border-0';
+                const statusClass = item.status === 'pending' ? 'text-yellow-600' : 'text-green-600';
+
+                row.innerHTML = `
+                    <td class="py-2 px-4 text-center">${item.amount}</td>
+                    <td class="py-2 px-4 text-center">${item.method}</td>
+                    <td class="py-2 px-4 text-center"><span class="${statusClass}">${item.status === 'pending' ? 'Pending' : 'Completed'}</span></td>
+                `;
+                tableBody.appendChild(row);
+            });
+        }
+
+
+        async function submitWithdrawal() {
+            if (!userId) {
+                showModal('Error', 'Please log in.');
+                return;
+            }
+            const method = document.getElementById('withdrawal-method').value;
+            const account = document.getElementById('withdrawal-account').value.trim();
+            if (!method || !account) {
+                showModal('Please Fill Out the Form', 'Please fill out all the fields.');
+                return;
+            }
+            const userDocRef = doc(db, `/artifacts/${appId}/users/${userId}/userData/profile`);
+            const userDoc = await getDoc(userDocRef);
+            const data = userDoc.data();
+            if ((data.balance || 0) < withdrawLimit) {
+                showModal('Limit Exceeded', `Your current balance is ${data.balance || 0} BDT, which is below the withdrawal limit of (${withdrawLimit} BDT).`);
+                return;
+            }
+            if ((data.totalReferrals || 0) < referLimit) {
+                showModal('Referral Limit', `You need at least ${referLimit} referrals to withdraw.`);
+                return;
+            }
+            try {
+                const withdrawalRef = collection(db, `/artifacts/${appId}/public/data/withdrawals`);
+                await addDoc(withdrawalRef, {
+                    userId: userId,
+                    method: method,
+                    account: account,
+                    amount: data.balance,
+                    status: 'pending',
+                    timestamp: Date.now()
+                });
+                await updateDoc(userDocRef, { balance: 0 });
+                showModal('Success', 'Your withdrawal request has been submitted successfully.');
+            } catch (error) {
+                console.error("Error submitting withdrawal: ", error);
+                showModal('Error', 'There was a problem submitting the withdrawal.');
+            }
+        }
+        
+        function getReferralLink() {
+            if (!userId) {
+                showModal('Error', 'Please log in to generate a referral link.');
+                return "Please log in";
+            }
+            // Replace <YOUR_TELEGRAM_BOT_USERNAME> with your actual bot's username
+            return `https://t.me/<YOUR_TELEGRAM_BOT_USERNAME>?start=${userId}`;
+        }
+
+        // Page navigation logic
+        function showPage(pageId) {
+            const pages = ['home', 'earning', 'refer', 'withdrawal'];
+            pages.forEach(p => {
+                document.getElementById(p + '-page').classList.add('hidden');
+            });
+            document.getElementById(pageId + '-page').classList.remove('hidden');
+            
+            if (pageId === 'refer') {
+                const referLink = getReferralLink();
+                document.getElementById('referral-link').value = referLink;
+            }
+        }
+        
+        function copyLink() {
+            const linkInput = document.getElementById('referral-link');
+            linkInput.select();
+            document.execCommand('copy');
+            showModal('Copy Successful', 'Referral link has been copied!');
+        }
+
+        // Run on page load
+        window.onload = function() {
+            document.getElementById('home-btn').addEventListener('click', () => showPage('home'));
+            document.getElementById('earning-btn').addEventListener('click', () => showPage('earning'));
+            document.getElementById('refer-btn').addEventListener('click', () => showPage('refer'));
+            document.getElementById('withdrawal-btn').addEventListener('click', () => showPage('withdrawal'));
+            document.getElementById('earn-button').addEventListener('click', watchAd);
+            document.getElementById('daily-bonus-btn').addEventListener('click', claimDailyBonus);
+            document.getElementById('submit-withdrawal-btn').addEventListener('click', submitWithdrawal);
+            document.getElementById('copy-btn').addEventListener('click', copyLink);
+            document.getElementById('close-modal').addEventListener('click', hideModal);
+            
+            // Task buttons
+            document.getElementById('task-1-btn').addEventListener('click', () => completeTask('task-1', 10)); // Example task with 10 BDT reward
+            document.getElementById('task-2-btn').addEventListener('click', () => completeTask('task-2', 15)); // Example task with 15 
